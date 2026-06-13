@@ -1,0 +1,36 @@
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate.format_sql: true
+  flyway:
+    enabled: true
+  data:
+    elasticsearch:
+      repositories:
+        enabled: false
+  kafka:
+    consumer:
+      auto-offset-reset: earliest
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # tests bypass actual JWT — use stub or method-security
+          issuer-uri: http://localhost/none
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+
+pricing:
+  tax-rate: 0.05
+
+minio:
+  endpoint: http://localhost:0
+  access-key: test
+  secret-key: testsecret
+  bucket: test
