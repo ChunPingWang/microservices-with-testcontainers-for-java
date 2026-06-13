@@ -31,7 +31,12 @@
   - [6.3 Consumer-Driven Contract（inter-service）](#63-consumer-driven-contractinter-service)
   - [6.4 Contract Testing 的「投入產出」決策](#64-contract-testing-的投入產出決策)
 - [第 7 章：怎麼跑測試](#第-7-章怎麼跑測試)
-- [第 8 章：故障排除 FAQ](#第-8-章故障排除-faq)
+- [第 8 章：圖解 — 類別圖、循序圖、ER Diagram](#第-8-章圖解--類別圖循序圖er-diagram)
+  - [8.1 系統脈絡圖](#81-系統脈絡圖service-interaction)
+  - [8.2 類別圖（Domain Model）](#82-類別圖domain-model)
+  - [8.3 循序圖（Sequence）](#83-循序圖sequence)
+  - [8.4 ER Diagrams（資料庫 Schema）](#84-er-diagrams資料庫-schema)
+- [第 9 章：故障排除 FAQ](#第-9-章故障排除-faq)
 - [延伸閱讀](#延伸閱讀)
 
 ---
@@ -1083,7 +1088,536 @@ Testcontainers 第一次會 pull image：
 
 ---
 
-## 第 8 章：故障排除 FAQ
+## 第 8 章：圖解 — 類別圖、循序圖、ER Diagram
+
+> 全用 [Mermaid](https://mermaid.js.org/) 寫，GitHub 上會自動渲染。
+> 在 IntelliJ / VS Code 也有外掛預覽，本機看 raw markdown 也讀得懂。
+
+### 8.1 系統脈絡圖（Service Interaction）
+
+三個服務、五個基礎設施容器、誰跟誰講話的全貌：
+
+```mermaid
+flowchart LR
+    Client((Client))
+    Client -->|POST /api/orders| Product
+    Client -->|POST /api/inventory/<br/>deductions| Inventory
+    Client -.->|GET /api/products/search| Product
+
+    Product[product-service]
+    Payment[payment-service]
+    Inventory[inventory-service]
+
+    subgraph Bus[Kafka]
+        T1[/order.created/]
+        T2[/payment.completed/]
+        T3[/inventory.deducted/]
+    end
+
+    Product -->|publish| T1
+    T1 -->|consume| Payment
+    Payment -->|publish| T2
+    T2 -->|consume| Product
+    T2 -.->|consume| Inventory
+    Inventory -->|publish| T3
+    T3 -->|consume| Product
+
+    Product --- PgP[(PostgreSQL<br/>product)]
+    Product --- Redis1[(Redis<br/>cache)]
+    Product --- ES[(Elasticsearch)]
+    Product --- MinIO1[(MinIO)]
+
+    Payment --- PgM[(PostgreSQL<br/>payment)]
+    Payment --- Vault[(Vault)]
+    Payment --- MinIO2[(MinIO)]
+
+    Inventory --- PgI[(PostgreSQL<br/>inventory)]
+    Inventory --- Redis2[(Redis<br/>lock)]
+```
+
+### 8.2 類別圖（Domain Model）
+
+每個服務的核心 Aggregate + Value Object 結構。
+
+#### 8.2.1 Product Service — Order Aggregate
+
+```mermaid
+classDiagram
+    direction LR
+
+    class Order {
+        -OrderId id
+        -String buyerId
+        -List~OrderLine~ lines
+        -Money totalAmount
+        -OrderStatus status
+        -long version
+        +place(buyerId, lines, clock)$ Order
+        +rehydrate(...)$ Order
+        +markPaid(paymentId, clock)
+        +complete(clock)
+        +cancel(reason, clock)
+        +drainEvents() List~OrderEvent~
+    }
+    class OrderLine {
+        <<record>>
+        +String sku
+        +Quantity quantity
+        +Money unitPrice
+        +subtotal() Money
+    }
+    class OrderId {
+        <<record>>
+        +UUID value
+    }
+    class OrderStatus {
+        <<sealed interface>>
+        +Instant at()
+    }
+    class Created {
+        <<record>>
+    }
+    class Paid {
+        <<record>>
+        +UUID paymentId
+    }
+    class Completed {
+        <<record>>
+    }
+    class Cancelled {
+        <<record>>
+        +String reason
+    }
+    class Money {
+        <<record>>
+        +BigDecimal amount
+        +Currency currency
+    }
+    class Quantity {
+        <<record>>
+        +int value
+    }
+    class PricingService {
+        +applyTax(Money) Money
+        +applyVolumeDiscount(Money) Money
+    }
+
+    Order "1" *-- "1..*" OrderLine : lines
+    Order "1" *-- "1" OrderStatus : status
+    Order ..> OrderId
+    Order ..> Money : totalAmount
+    OrderLine ..> Money
+    OrderLine ..> Quantity
+    OrderStatus <|.. Created
+    OrderStatus <|.. Paid
+    OrderStatus <|.. Completed
+    OrderStatus <|.. Cancelled
+    PricingService ..> Money
+```
+
+#### 8.2.2 Payment Service — Payment Aggregate
+
+```mermaid
+classDiagram
+    direction LR
+
+    class Payment {
+        -PaymentId id
+        -UUID orderId
+        -String buyerId
+        -IdempotencyKey idempotencyKey
+        -PaymentMethod method
+        -Money amount
+        -PaymentStatus status
+        -long version
+        +initiate(...)$ Payment
+        +authorise(authCode, clock)
+        +complete(receiptUri, clock)
+        +fail(reason, clock)
+        +refund(reason, clock)
+    }
+    class IdempotencyKey {
+        <<record>>
+        +String value
+    }
+    class PaymentId {
+        <<record>>
+        +UUID value
+    }
+    class PaymentMethod {
+        <<enum>>
+        CREDIT_CARD
+        DEBIT_CARD
+        BANK_TRANSFER
+        WALLET
+    }
+    class PaymentStatus {
+        <<sealed interface>>
+        +Instant at()
+    }
+    class Initiated {
+        <<record>>
+    }
+    class Authorised {
+        <<record>>
+        +String authCode
+    }
+    class PaymentCompleted {
+        <<record>>
+        +String receiptUri
+    }
+    class Failed {
+        <<record>>
+        +String reason
+    }
+    class Refunded {
+        <<record>>
+        +String reason
+    }
+    class PaymentValidationService {
+        +validate(Payment)
+    }
+
+    Payment ..> IdempotencyKey
+    Payment ..> PaymentId
+    Payment ..> PaymentMethod
+    Payment ..> PaymentStatus
+    PaymentStatus <|.. Initiated
+    PaymentStatus <|.. Authorised
+    PaymentStatus <|.. PaymentCompleted
+    PaymentStatus <|.. Failed
+    PaymentStatus <|.. Refunded
+    PaymentValidationService ..> Payment
+```
+
+#### 8.2.3 Inventory Service — Stock Aggregate
+
+```mermaid
+classDiagram
+    direction LR
+
+    class Stock {
+        -SkuId sku
+        -Quantity available
+        -Map~UUID,Quantity~ reservations
+        -long version
+        +seed(sku, initial)$ Stock
+        +rehydrate(...)$ Stock
+        +reserve(orderId, amount)
+        +commit(orderId)
+        +release(orderId)
+        +level() StockLevel
+        +reservations() List~Reservation~
+    }
+    class SkuId {
+        <<record>>
+        +String value
+    }
+    class Quantity {
+        <<record>>
+        +int value
+    }
+    class Reservation {
+        <<record>>
+        +UUID orderId
+        +Quantity quantity
+    }
+    class StockLevel {
+        <<record>>
+        +Quantity available
+        +Quantity reserved
+        +onHand() Quantity
+    }
+    class InsufficientStockException
+
+    Stock ..> SkuId : sku
+    Stock ..> Quantity : available
+    Stock ..> StockLevel : returns
+    Stock ..> Reservation : returns
+    Stock --> InsufficientStockException : throws
+    Reservation ..> Quantity
+    StockLevel ..> Quantity
+```
+
+#### 8.2.4 Hexagonal Port ↔ Adapter（以 OrderWriteRepository 為例）
+
+每個 outbound port 都有「介面 + 多個實作」的形狀。Application layer 只認介面，
+所以 InMemory adapter 跟 JPA adapter 對它而言完全等價（Contract Test 強制這個等價）。
+
+```mermaid
+classDiagram
+    direction TB
+
+    class OrderWriteRepository {
+        <<interface>>
+        +save(Order) Order
+        +findById(OrderId) Optional~Order~
+    }
+    class PlaceOrderCommandHandler {
+        -OrderWriteRepository repo
+        -EventPublisher publisher
+        -Clock clock
+        +place(PlaceOrderCommand) OrderId
+    }
+    class InMemoryOrderWriteRepository {
+        <<fake>>
+        -Map store
+        +save(Order) Order
+        +findById(OrderId) Optional~Order~
+    }
+    class JpaOrderWriteRepository {
+        <<@Repository>>
+        -OrderJpaRepository jpa
+        +save(Order) Order
+        +findById(OrderId) Optional~Order~
+    }
+    class OrderWriteRepositoryContract {
+        <<abstract test>>
+        #repository()* OrderWriteRepository
+        +save_then_load()
+        +status_transitions_round_trip()
+        +cancelled_keeps_reason()
+    }
+    class InMemoryOrderWriteRepositoryContractTest
+    class JpaOrderWriteRepositoryContractTest
+
+    PlaceOrderCommandHandler ..> OrderWriteRepository : depends
+    OrderWriteRepository <|.. InMemoryOrderWriteRepository : implements
+    OrderWriteRepository <|.. JpaOrderWriteRepository : implements
+    OrderWriteRepositoryContract <|-- InMemoryOrderWriteRepositoryContractTest
+    OrderWriteRepositoryContract <|-- JpaOrderWriteRepositoryContractTest
+    InMemoryOrderWriteRepositoryContractTest ..> InMemoryOrderWriteRepository : verifies
+    JpaOrderWriteRepositoryContractTest ..> JpaOrderWriteRepository : verifies
+```
+
+### 8.3 循序圖（Sequence）
+
+#### 8.3.1 下單 Happy Path 全鏈路
+
+對應 `FullChainE2ETest.happy_path_order_pays_and_deducts_stock`：
+
+```mermaid
+sequenceDiagram
+    actor Client
+    participant P as product-service
+    participant K as Kafka
+    participant V as Vault
+    participant Pay as payment-service
+    participant MIO as MinIO
+    participant I as inventory-service
+    participant R as Redis
+
+    Client->>+P: POST /api/orders<br/>{buyer, lines}
+    P->>P: Order.place()
+    P->>P: orderRepo.save()
+    P->>K: publish order.created
+    P-->>-Client: 201 {orderId}
+
+    K-->>+Pay: order.created
+    Pay->>Pay: findByIdempotencyKey("order-" + orderId)
+    Pay->>Pay: Payment.initiate()
+    Pay->>+V: get("payment.api-key")
+    V-->>-Pay: api-key
+    Pay->>Pay: gateway.authorise()
+    Pay->>+MIO: putObject(receipt.pdf)
+    MIO-->>-Pay: s3://payment-receipts/...
+    Pay->>Pay: payment.complete(receiptUri)
+    Pay->>K: publish payment.completed
+    deactivate Pay
+
+    Note over K,I: payment.completed 廣播給 product + inventory<br/>(本 demo orchestrator 也會 POST 給 inventory)
+
+    Client->>+I: POST /api/inventory/deductions
+    I->>+R: tryLock("stock:SKU-COFFEE", 5s, 10s)
+    R-->>-I: acquired
+    I->>I: stockRepo.findBySku()
+    I->>I: stock.reserve(orderId, 2)
+    I->>I: stock.commit(orderId)
+    I->>I: stockRepo.save()
+    I->>K: publish inventory.deducted
+    I->>R: unlock
+    I-->>-Client: 202 Accepted
+
+    K-->>P: inventory.deducted
+    P->>P: order.complete()
+```
+
+#### 8.3.2 Idempotency Key 重複事件防護
+
+對應 `InMemoryPaymentRepositoryContractTest.find_by_idempotency_key_*`
++ `ProcessPaymentCommandHandlerTest.idempotent_replay_returns_same_payment_id_no_new_event`：
+
+```mermaid
+sequenceDiagram
+    participant K as Kafka<br/>(order.created topic)
+    participant H as ProcessPaymentCommandHandler
+    participant Repo as PaymentRepository
+    participant E as EventPublisher
+
+    K->>+H: deliver event 1 {orderId=O1}
+    H->>Repo: findByIdempotencyKey("order-O1")
+    Repo-->>H: Optional.empty
+    H->>H: Payment.initiate() → authorise → complete
+    H->>Repo: save(Payment{id=P1, key="order-O1"})
+    H->>E: publish PaymentCompleted{paymentId=P1}
+    deactivate H
+
+    Note over K: 至少一次 (at-least-once) 投遞<br/>網路抖動/consumer rebalance 觸發重送
+
+    K->>+H: deliver event 1 again {orderId=O1}
+    H->>Repo: findByIdempotencyKey("order-O1")
+    Repo-->>H: Optional.of(Payment{id=P1})
+    H-->>K: return P1 (no new auth, no new event)
+    deactivate H
+```
+
+#### 8.3.3 併發扣庫存的 Redis 分散鎖
+
+對應 `RedisDistributedLockAdapterIT.serialises_concurrent_increments`
+（同邏輯，不同 domain）：
+
+```mermaid
+sequenceDiagram
+    participant T1 as Thread A
+    participant T2 as Thread B
+    participant L as RedisDistributedLockAdapter
+    participant R as Redis
+    participant S as Stock Aggregate
+
+    par 同時呼叫
+        T1->>+L: withLock("stock:SKU-A", 5s, 10s, action)
+        L->>+R: tryLock(key, 5000ms)
+        R-->>-L: acquired
+    and
+        T2->>+L: withLock("stock:SKU-A", 5s, 10s, action)
+        L->>+R: tryLock(key, 5000ms)
+        R-->>-L: BUSY, retry...
+    end
+
+    L->>S: action.get() (reserve + commit)
+    S-->>L: ok
+    L->>R: unlock(key)
+    L-->>-T1: result
+
+    Note over R: 鎖釋放，T2 拿到
+
+    R-->>L: acquired (for T2)
+    L->>S: action.get() (reserve + commit)
+    S-->>L: ok
+    L->>R: unlock(key)
+    L-->>-T2: result
+
+    Note over T1,T2: 200 次 increment 全部串行化<br/>最終 counter == thread × per_thread
+```
+
+### 8.4 ER Diagrams（資料庫 Schema）
+
+對應 `*/src/main/resources/db/migration/{service}/V1__*.sql`，由 Flyway 在 service 啟動時建立。
+
+#### 8.4.1 Product Service — `product` 資料庫
+
+```mermaid
+erDiagram
+    products {
+        uuid id PK
+        varchar(64) sku UK
+        varchar(255) name
+        text description
+        numeric(19_4) price_amount
+        varchar(3) price_currency
+        boolean active
+    }
+    orders {
+        uuid id PK
+        varchar(128) buyer_id
+        numeric(19_4) total_amount
+        varchar(3) total_currency
+        varchar(32) status
+        uuid payment_id
+        timestamptz status_at
+        text cancel_reason
+        bigint version
+    }
+    order_lines {
+        uuid order_id PK,FK
+        int line_index PK
+        varchar(64) sku
+        int quantity
+        numeric(19_4) unit_price
+        varchar(3) unit_currency
+    }
+
+    orders ||--o{ order_lines : "contains"
+```
+
+- `orders.version` → JPA `@Version` 樂觀鎖。
+- `orders.status` 文字欄位（CREATED / PAID / COMPLETED / CANCELLED）對應 sealed `OrderStatus`，由 `JpaOrderWriteRepository` 在 Java 21 pattern matching switch 中翻譯。
+- `order_lines` 用 `@ElementCollection`，不是獨立 aggregate。
+
+#### 8.4.2 Payment Service — `payment` 資料庫
+
+```mermaid
+erDiagram
+    payments {
+        uuid id PK
+        uuid order_id
+        varchar(128) buyer_id
+        varchar(128) idempotency_key UK
+        varchar(32) method
+        numeric(19_4) amount
+        varchar(3) currency
+        varchar(32) status
+        timestamptz status_at
+        varchar(64) auth_code
+        varchar(2048) receipt_uri
+        text failure_reason
+        bigint version
+    }
+```
+
+- `idempotency_key` UNIQUE 約束是 idempotency 的**最後一道防線** — application 層的
+  `findByIdempotencyKey` 先看，但若兩個 thread 同時進來，DB 的 UNIQUE 會 reject 第二個 insert。
+- 沒有外鍵指向 product DB 的 `orders.id` — 跨服務不共享外鍵，只共享 ID（typed reference）。
+
+#### 8.4.3 Inventory Service — `inventory` 資料庫
+
+```mermaid
+erDiagram
+    stocks {
+        varchar(64) sku PK
+        int available
+        bigint version
+    }
+    reservations {
+        varchar(64) sku PK,FK
+        uuid order_id PK
+        int quantity
+    }
+
+    stocks ||--o{ reservations : "holds"
+```
+
+- `(sku, order_id)` 是複合主鍵 → 同一個 order 在同一個 sku 只能 reserve 一次 → 對應
+  `Stock.reserve(orderId, qty)` 的 idempotent 行為。
+- 同樣**不用外鍵指向 product 的 orders.id**。orderId 是 cross-service shared identifier。
+
+### 8.5 圖跟測試的對應關係
+
+| 圖                          | 對應的測試                                                        |
+|-----------------------------|------------------------------------------------------------------|
+| 8.1 系統脈絡圖              | `FullChainE2ETest`（整個跑完一遍）                                |
+| 8.2.1 Order 類別圖          | `OrderTest`、`PlaceOrderCommandHandlerTest`                       |
+| 8.2.2 Payment 類別圖        | `PaymentTest`、`ProcessPaymentCommandHandlerTest`                 |
+| 8.2.3 Stock 類別圖          | `StockTest`、`DeductInventoryCommandHandlerTest`                  |
+| 8.2.4 Port↔Adapter         | `OrderWriteRepositoryContract` 的 2 個 subclass                   |
+| 8.3.1 全鏈路循序            | `FullChainE2ETest.happy_path_order_pays_and_deducts_stock`        |
+| 8.3.2 Idempotency 循序      | `ProcessPaymentCommandHandlerTest.idempotent_replay_*`            |
+| 8.3.3 分散鎖循序            | `RedisDistributedLockAdapterIT.serialises_concurrent_increments`  |
+| 8.4 ER 三組                  | 對應 3 個 `Jpa*RepositoryIT` 跑真實 PostgreSQL 驗證 schema       |
+
+---
+
+## 第 9 章：故障排除 FAQ
 
 ### Q1：跑 IT 卡在 "Could not find a valid Docker environment"
 
