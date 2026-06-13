@@ -1,4 +1,4 @@
-# Testcontainers 電商微服務整合測試教程
+# Java/Spring Boot 4 微服務應用 — Testcontainers 學習專案
 
 > 用 Java 21 + Spring Boot + Testcontainers，從零打造三個微服務（商品 / 支付 / 庫存），
 > 走通 Hexagonal Architecture（六角架構）+ DDD + CQRS，並以「真實容器」驗證完整下單流程。
@@ -121,8 +121,8 @@ IntelliJ IDEA / VS Code 都可以，重點是：
 如果你只是想先看到效果：
 
 ```bash
-# 1. clone 後進到專案
-cd ecommerce-testcontainers
+# 1. clone 後進到 repo 根目錄
+cd microservices-with-testcontainers-for-java
 
 # 2. 跑所有「不需要容器」的單元測試（最快，秒回）
 ./gradlew :shared-kernel:test \
@@ -182,11 +182,15 @@ TESTCONTAINERS_CHECKS_DISABLE=true \
 ## 第 3 章：專案結構與分層
 
 ```
-ecommerce-testcontainers/
+microservices-with-testcontainers-for-java/    # repo root
+├── README.md                     # 本檔
 ├── settings.gradle.kts           # 列出所有子模組
 ├── build.gradle.kts              # 根層：BOM 統一版本
-├── gradle/wrapper/               # Gradle wrapper
+├── gradlew, gradlew.bat          # Gradle wrapper 腳本
+├── gradle/wrapper/               # Gradle wrapper jar / properties
 ├── .github/workflows/ci.yml      # CI：unit → integration → e2e 三階段
+├── docs/                         # 教學計畫、設計筆記
+│   └── testcontainers-tutorial-plan-v2.md
 │
 ├── shared-kernel/                # 跨服務共用：純 Java，無 Spring
 │   └── src/main/java/com/example/ecommerce/shared/
