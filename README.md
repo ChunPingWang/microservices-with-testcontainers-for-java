@@ -25,8 +25,13 @@
   - [5.3 Payment Service（支付）](#53-payment-service支付)
   - [5.4 Inventory Service（庫存）](#54-inventory-service庫存)
   - [5.5 E2E：跨服務全鏈路測試](#55-e2e跨服務全鏈路測試)
-- [第 6 章：怎麼跑測試](#第-6-章怎麼跑測試)
-- [第 7 章：故障排除 FAQ](#第-7-章故障排除-faq)
+- [第 6 章：Contract Testing — 把「介面合約」變成自動測試](#第-6-章contract-testing--把介面合約變成自動測試)
+  - [6.1 兩種層級對照](#61-兩種層級對照)
+  - [6.2 Port 行為合約（intra-service）](#62-port-行為合約intra-service)
+  - [6.3 Consumer-Driven Contract（inter-service）](#63-consumer-driven-contractinter-service)
+  - [6.4 Contract Testing 的「投入產出」決策](#64-contract-testing-的投入產出決策)
+- [第 7 章：怎麼跑測試](#第-7-章怎麼跑測試)
+- [第 8 章：故障排除 FAQ](#第-8-章故障排除-faq)
 - [延伸閱讀](#延伸閱讀)
 
 ---
@@ -796,9 +801,208 @@ await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
 
 ---
 
-## 第 6 章：怎麼跑測試
+## 第 6 章：Contract Testing — 把「介面合約」變成自動測試
 
-### 6.1 測試金字塔
+> 合約測試（Contract Testing）回答的問題是：
+> **「我們約定好的介面，雙方真的都遵守嗎？」**
+
+微服務裡有**兩個不同層級**的合約測試，常被混為一談，但解決的痛點完全不同。
+本教程兩個都涵蓋。
+
+### 6.1 兩種層級對照
+
+| 層級                    | 合約位置          | 雙方                                | 解決的問題                                  | 本專案做法                          |
+|-------------------------|------------------|-------------------------------------|---------------------------------------------|-------------------------------------|
+| **Port 行為合約**       | service 內部     | Domain Port ↔ 多個 Adapter         | InMemory fake 和真實 adapter 行為會分歧     | 抽象 Contract class + 多個 subclass |
+| **Consumer-Driven 合約**| service 之間     | 上游 (provider) ↔ 下游 (consumer)  | 上游改 JSON schema 沒通知下游就上 prod      | Pact / Spring Cloud Contract（建議）|
+
+### 6.2 Port 行為合約（intra-service）
+
+#### 為什麼需要
+
+回顧第 4.1 章的設計：
+
+```java
+public interface OrderWriteRepository { ... }
+
+public class InMemoryOrderWriteRepository implements OrderWriteRepository { ... }   // unit test 用
+public class JpaOrderWriteRepository      implements OrderWriteRepository { ... }   // 正式環境
+```
+
+問題：如果**這兩個實作行為不一致**會怎樣？
+
+實例：
+- InMemory 的 `findById` 永遠回最新狀態；
+- JPA 因為 `@Transactional` 邊界寫對了沒，可能拿到 stale data。
+
+於是 unit test（用 InMemory）綠了，prod 卻爛。**Liskov 替換原則被悄悄破壞**。
+
+#### 解法：抽象 Contract class
+
+寫一份**抽象測試類別**，定義所有實作都必須通過的行為：
+
+```java
+// payment-service/src/test/.../contract/PaymentRepositoryContract.java
+public abstract class PaymentRepositoryContract {
+
+    protected abstract PaymentRepository repository();      // 子類別提供實作
+
+    @Test
+    void find_by_idempotency_key_returns_existing_payment() {
+        Payment p = Payment.initiate(...);
+        repository().save(p);
+
+        assertThat(repository().findByIdempotencyKey(p.idempotencyKey()))
+                .isPresent()
+                .get().extracting(Payment::id).isEqualTo(p.id());
+    }
+
+    @Test
+    void status_transition_authorised_then_completed_is_persisted() { ... }
+    // … 5 條測試
+}
+```
+
+每個實作各寫一個極簡 subclass：
+
+```java
+// 用 InMemory fake，毫秒級
+class InMemoryPaymentRepositoryContractTest extends PaymentRepositoryContract {
+    private final InMemoryPaymentRepository repo = new InMemoryPaymentRepository();
+    @Override protected PaymentRepository repository() { return repo; }
+}
+
+// 用真實 JPA + Testcontainers PostgreSQL，秒級
+@DataJpaTest @Testcontainers @Tag("integration")
+class JpaPaymentRepositoryContractTest extends PaymentRepositoryContract {
+
+    @Container static PostgreSQLContainer<?> postgres = ...;
+
+    @Autowired JpaPaymentRepository jpa;
+    @Override protected PaymentRepository repository() { return jpa; }
+}
+```
+
+JUnit 5 會在 subclass 自動跑父類的所有 `@Test`，**同一份測試跑兩遍**。
+
+#### 本專案的 Port 合約
+
+| Contract                       | InMemory subclass                                | Real subclass                                  |
+|--------------------------------|--------------------------------------------------|------------------------------------------------|
+| `OrderWriteRepositoryContract` | `InMemoryOrderWriteRepositoryContractTest`       | `JpaOrderWriteRepositoryContractTest`          |
+| `PaymentRepositoryContract`    | `InMemoryPaymentRepositoryContractTest`          | `JpaPaymentRepositoryContractTest`             |
+| `StockRepositoryContract`      | `InMemoryStockRepositoryContractTest`            | `JpaStockRepositoryContractTest`               |
+
+共 **6 個 subclass**，每個跑 3~5 條測試，**InMemory 跑 ~3 秒，JPA 整套 ~30 秒**。
+
+#### 取捨小提醒
+
+- **Contract 不該驗證「實作細節」**，只驗證對呼叫者可觀察的行為。例：「JPA 用了哪一個 SQL」**不該**寫進 contract。
+- **每個實作可以多寫自己專屬的測試**。例：JPA 額外驗 optimistic lock；InMemory 額外驗 thread-safety。Contract 只是底線。
+- **新增 adapter 的標準流程**：
+  1. 寫一個新的 subclass 繼承既有 Contract
+  2. 通過 → 直接上線
+  3. 不通過 → 修 adapter（或如果是 Contract 不合理，調整 Contract，**所有人重跑**）
+
+### 6.3 Consumer-Driven Contract（inter-service）
+
+#### 為什麼 Port 合約不夠
+
+Port 合約解決「**我自己的 InMemory fake 騙我**」。
+但跨服務的問題是：「**上游改了 JSON schema，下游不知道**」。
+
+例：product-service 把 `OrderCreatedIntegrationEvent` 的 `totalAmount` 從 number 改成字串，
+payment-service 反序列化時直接炸 — 但兩邊的 unit test 都還是綠的。
+
+#### 兩種主流工具
+
+| 工具                          | 路線                                  | 適合場景                              |
+|-------------------------------|---------------------------------------|---------------------------------------|
+| **Pact**                      | Consumer 端寫期望 → 生 pact JSON → Provider 端 verify | 跨團隊、跨語言、廣為使用            |
+| **Spring Cloud Contract**     | Provider 端寫 contract → 生 stub jar → Consumer 端用 | 純 Spring 團隊、與 Spring 整合最緊密|
+
+Pact 還支援 **Pact Broker** — 集中存放 contract，CI 自動 publish + verify。
+
+#### 本專案目前的近似做法（shared-kernel 當「結構合約」）
+
+我們把所有 Integration Event 定義在 `shared-kernel/event/`：
+
+```java
+public record OrderCreatedIntegrationEvent(
+        UUID eventId,
+        Instant occurredAt,
+        UUID orderId,
+        String buyerId,
+        BigDecimal totalAmount,
+        String currency,
+        List<Line> lines
+) implements IntegrationEvent { ... }
+```
+
+product-service 發布、payment-service 消費的**都是同一個 record class**。
+編譯期就保證**結構一致**。
+
+這只解決了結構問題，**沒解決語義問題**（例：欄位值的合理範圍、null 與否、列舉值）。
+如果要嚴格，下面這條路推薦：
+
+#### 升級方向（本教程未實作，留作練習）
+
+```
+                     ┌─────────────────────────────┐
+                     │ payment-service (consumer)   │
+                     │  pact test：                  │
+                     │   "我期望 order.created       │
+                     │    totalAmount > 0、          │
+                     │    currency 是 3-char ISO"    │
+                     └────────────┬────────────────┘
+                                  │ generate
+                                  ▼
+                         ┌─────────────────┐
+                         │ order.created    │
+                         │ -consumer.json   │
+                         │ (pact 檔)         │
+                         └────────┬────────┘
+                                  │ upload
+                                  ▼
+                         ┌─────────────────┐
+                         │ Pact Broker      │
+                         └────────┬────────┘
+                                  │ verify
+                                  ▼
+                     ┌─────────────────────────────┐
+                     │ product-service (provider)   │
+                     │  pact verify：                │
+                     │   啟動 service、發 event、    │
+                     │   跑 consumer 的期望          │
+                     └─────────────────────────────┘
+```
+
+實作參考：[pact-jvm-consumer-junit5](https://docs.pact.io/implementation_guides/jvm/consumer/junit5)
++ Pact 的 Message 模式（不是 HTTP，是訊息匯流排）。
+
+#### Schema Registry 的替代方案
+
+如果不想引入 Pact，業界另一個常見做法：**Schema Registry**（Confluent Schema Registry / Apicurio）。
+事件用 Avro / Protobuf 序列化，schema 集中存。上游升級 schema 強制向後相容（broker reject），
+**生產時就擋下**而不是等 runtime 才炸。本教程用 JSON，跳過了這個。
+
+### 6.4 Contract Testing 的「投入產出」決策
+
+不是每個 port 都值得 contract test。判斷標準：
+
+| 情境                                                       | 該做嗎  |
+|-----------------------------------------------------------|---------|
+| 有 InMemory fake **且**有真實 adapter，application 都依賴 port | ✅ 該   |
+| 只有一個 adapter（永遠不會換），且 application 直接用真實的 | ⛔ 不必 |
+| Port 只在 single-test 使用（沒有共用價值）                 | ⛔ 不必 |
+| 跨服務 schema，雙方對欄位含義有 prior agreement              | ✅ Pact |
+| 跨服務 schema，可直接用 shared-kernel 的 class              | △ 可選 |
+
+---
+
+## 第 7 章：怎麼跑測試
+
+### 7.1 測試金字塔
 
 ```
                        ╱╲
@@ -815,7 +1019,7 @@ await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
             ╱────────────────────╲
 ```
 
-### 6.2 常用指令
+### 7.2 常用指令
 
 ```bash
 # 只跑單元測試（不需 Docker）
@@ -832,7 +1036,7 @@ await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
 open product-service/build/reports/tests/test/index.html
 ```
 
-### 6.3 Tag 過濾
+### 7.3 Tag 過濾
 
 每個 IT/E2E 測試都標了 JUnit Tag：
 
@@ -847,7 +1051,7 @@ CI 三階段（見 `.github/workflows/ci.yml`）就是用 tag 分群：
 unit → integration (matrix per service) → e2e
 ```
 
-### 6.4 第一次跑會慢
+### 7.4 第一次跑會慢
 
 Testcontainers 第一次會 pull image：
 
@@ -864,7 +1068,7 @@ Testcontainers 第一次會 pull image：
 
 ---
 
-## 第 7 章：故障排除 FAQ
+## 第 8 章：故障排除 FAQ
 
 ### Q1：跑 IT 卡在 "Could not find a valid Docker environment"
 
