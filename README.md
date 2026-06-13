@@ -193,7 +193,6 @@ microservices-with-testcontainers-for-java/    # repo root
 ├── build.gradle.kts              # 根層：BOM 統一版本
 ├── gradlew, gradlew.bat          # Gradle wrapper 腳本
 ├── gradle/wrapper/               # Gradle wrapper jar / properties
-├── .github/workflows/ci.yml      # CI：unit → integration → e2e 三階段
 ├── docs/                         # 教學計畫、設計筆記
 │   └── testcontainers-tutorial-plan-v2.md
 │
@@ -1045,10 +1044,26 @@ open product-service/build/reports/tests/test/index.html
 @Tag("e2e")          // 跨服務全鏈路
 ```
 
-CI 三階段（見 `.github/workflows/ci.yml`）就是用 tag 分群：
+CI 建議跑三階段，用 tag 分群（本專案不綁定特定 CI 平台，由你自己接 Jenkins / GitLab / 任何
+能跑 Docker 的 runner）：
 
 ```
 unit → integration (matrix per service) → e2e
+```
+
+對應的 Gradle 指令：
+
+```bash
+# unit + ArchUnit（不需 Docker）
+./gradlew test --tests '*Test' -x ':e2e-tests:test'
+
+# integration（每個服務分開跑容易並行）
+./gradlew :product-service:test --tests '*IT'
+./gradlew :payment-service:test --tests '*IT'
+./gradlew :inventory-service:test --tests '*IT'
+
+# e2e
+./gradlew :e2e-tests:test
 ```
 
 ### 7.4 第一次跑會慢
